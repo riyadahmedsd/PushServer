@@ -2,7 +2,6 @@ const express     = require('express');
 const admin       = require('firebase-admin');
 const bodyParser  = require('body-parser');
 const cors        = require('cors');
-const crypto      = require('crypto');
 
 const app = express();
 app.use(cors());
@@ -36,22 +35,6 @@ function appMetaRef(appId) {
   return db.collection('push_app_meta').doc(appId);
 }
 
-// Password → SHA-256 hash
-function hashPassword(password) {
-  return crypto.createHash('sha256').update(password).digest('hex');
-}
-
-// Password verify করো Firestore থেকে
-async function verifyPassword(appId, password) {
-  if (!password) return { ok: false, reason: 'password_required' };
-  const doc = await appMetaRef(appId).get();
-  if (!doc.exists) return { ok: false, reason: 'app_not_registered' };
-  const stored = doc.data().passwordHash;
-  if (!stored) return { ok: false, reason: 'no_password_set' };
-  if (stored !== hashPassword(password)) return { ok: false, reason: 'invalid_password' };
-  return { ok: true };
-}
-
 // ════════════════════════════════════════════════════════════
 // ROUTES
 // ════════════════════════════════════════════════════════════
@@ -60,36 +43,50 @@ app.get('/', (req, res) => {
   res.send('Wevlo Push Notification Server is Running!');
 });
 
+// ── Debug: দেখো এখন সার্ভারে কোন credential লোড হয়েছে ──
+// GET /debug
+app.get('/debug', (req, res) => {
+  res.json({
+    project_id:      serviceAccount.project_id,
+    client_email:    serviceAccount.client_email,
+    private_key_id:  serviceAccount.private_key_id,
+    private_key_len: (serviceAccount.private_key || '').length
+  });
+});
+
+// ── Debug: appId রেজিস্টার্ড আছে কিনা এবং কয়টা token আছে ──
+// GET /app-status?appId=com.myapp.xyz
+app.get('/app-status', async (req, res) => {
+  const { appId } = req.query;
+  if (!isValidAppId(appId)) return res.status(400).json({ success: false, error: 'valid appId required' });
+
+  try {
+    const metaDoc  = await appMetaRef(appId).get();
+    const tokenSnap = await devicesRef(appId).get();
+    res.json({
+      success:      true,
+      appId,
+      registered:   metaDoc.exists,
+      registeredAt: metaDoc.exists ? metaDoc.data().registeredAt : null,
+      tokenCount:   tokenSnap.size
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 // ── Register App (APK build থেকে password সেট হয়) ──
 // POST /register-app  { appId, password }
 app.post('/register-app', async (req, res) => {
-  const { appId, password } = req.body;
+  const { appId } = req.body;
   if (!isValidAppId(appId)) return res.status(400).json({ success: false, error: 'valid appId required' });
-  if (!password || password.length < 6) return res.status(400).json({ success: false, error: 'password min 6 chars' });
 
   try {
     const ref = appMetaRef(appId);
     const doc = await ref.get();
 
-    if (doc.exists && doc.data().passwordHash) {
-      // App already registered — existing password দিয়ে verify করতে হবে
-      const { currentPassword } = req.body;
-      if (!currentPassword) {
-        // First-time setup থেকে আলাদা — ignore করো (APK rebuild scenario)
-        // নতুন password hash update করো যদি same password হয়
-        if (doc.data().passwordHash === hashPassword(password)) {
-          return res.json({ success: true, message: 'already registered' });
-        }
-        return res.status(409).json({ success: false, error: 'app_already_registered' });
-      }
-      if (doc.data().passwordHash !== hashPassword(currentPassword)) {
-        return res.status(401).json({ success: false, error: 'invalid_current_password' });
-      }
-    }
-
     await ref.set({
       appId,
-      passwordHash: hashPassword(password),
       registeredAt: doc.exists ? doc.data().registeredAt : Date.now(),
       updatedAt:    Date.now()
     }, { merge: true });
@@ -105,18 +102,10 @@ app.post('/register-app', async (req, res) => {
 // ── Register Token (APK থেকে আসে) ──
 // POST /register-token  { token, appId, userAgent?, password? }
 app.post('/register-token', async (req, res) => {
-  const { token, appId, userAgent, password } = req.body;
+  const { token, appId, userAgent } = req.body;
 
   if (!token)               return res.status(400).json({ success: false, error: 'token required' });
   if (!isValidAppId(appId)) return res.status(400).json({ success: false, error: 'valid appId required' });
-
-  // Password দিলে verify করো, না দিলে allow করো (পুরনো APK backward compat)
-  if (password) {
-    const auth = await verifyPassword(appId, password);
-    if (!auth.ok && auth.reason === 'invalid_password') {
-      return res.status(401).json({ success: false, error: 'invalid_password' });
-    }
-  }
 
   try {
     await devicesRef(appId).doc(tokenDocId(token)).set({
@@ -138,19 +127,10 @@ app.post('/register-token', async (req, res) => {
 // ── Get tokens by appId (password required) ──
 // GET /tokens?appId=com.myapp.xyz&password=xxx
 app.get('/tokens', async (req, res) => {
-  const { appId, password } = req.query;
+  const { appId } = req.query;
   if (!isValidAppId(appId)) return res.status(400).json({ success: false, error: 'valid appId required' });
 
-  // Password verify
-  const auth = await verifyPassword(appId, password);
-  if (!auth.ok) {
-    // app_not_registered মানে এই app এখনো /register-app করেনি
-    // সেক্ষেত্রে password ছাড়াই allow করো (পুরনো flow)
-    if (auth.reason !== 'app_not_registered' && auth.reason !== 'no_password_set') {
-      return res.status(401).json({ success: false, error: auth.reason });
-    }
-    // app registered নেই — password check skip
-  }
+  // Password check disabled — সব request password ছাড়াই allow
 
   try {
     const snap   = await devicesRef(appId).get();
@@ -168,19 +148,10 @@ app.get('/tokens', async (req, res) => {
 // ── Send to one token (password required) ──
 // POST /send-notification  { token, title, body, password, appId }
 app.post('/send-notification', async (req, res) => {
-  const { token, title, body, imageUrl, password, appId } = req.body;
+  const { token, title, body, imageUrl } = req.body;
   if (!token) return res.status(400).json({ success: false, error: 'token required' });
 
-  // Password verify (appId দিলে verify করো)
-  if (appId && password) {
-    const auth = await verifyPassword(appId, password);
-    if (!auth.ok && auth.reason === 'invalid_password') {
-      return res.status(401).json({ success: false, error: 'invalid_password' });
-    }
-    // app_not_registered বা no_password_set হলে allow করো
-  } else if (!appId || !password) {
-    // পুরনো client যারা appId/password পাঠায় না — allow করো
-  }
+  // Password check disabled — password ছাড়াই allow
 
   try {
     const t = title || 'Notification';
@@ -203,12 +174,10 @@ app.post('/send-notification', async (req, res) => {
 // ── Send to ALL tokens of an appId (password required) ──
 // POST /send-all  { appId, title, body, password }
 app.post('/send-all', async (req, res) => {
-  const { appId, title, body, imageUrl, password } = req.body;
+  const { appId, title, body, imageUrl } = req.body;
   if (!isValidAppId(appId)) return res.status(400).json({ success: false, error: 'valid appId required' });
 
-  // Password verify
-  const auth = await verifyPassword(appId, password);
-  if (!auth.ok) return res.status(401).json({ success: false, error: auth.reason });
+  // Password check disabled — password ছাড়াই allow
 
   try {
     const snap = await devicesRef(appId).get();
@@ -250,11 +219,10 @@ app.post('/send-all', async (req, res) => {
 // ── Delete a token (password required) ──
 // DELETE /token?appId=com.myapp&token=xxx&password=yyy
 app.delete('/token', async (req, res) => {
-  const { appId, token, password } = req.query;
+  const { appId, token } = req.query;
   if (!isValidAppId(appId) || !token) return res.status(400).json({ success: false, error: 'appId and token required' });
 
-  const auth = await verifyPassword(appId, password);
-  if (!auth.ok) return res.status(401).json({ success: false, error: auth.reason });
+  // Password check disabled — password ছাড়াই allow
 
   try {
     await devicesRef(appId).doc(tokenDocId(token)).delete();
